@@ -1,0 +1,396 @@
+--[[
+    VIP DELS HUB | IMGUI + DYNAMIC ISLAND | COIN FARM (AUTHORIZED USE)
+    Focused replacement for the "Sleep For UGC" Auto Farm Coins section
+    found in the supplied script.
+
+    Uses depthso/Roblox-ImGUI-style API:
+      ImGui:CreateWindow
+      Window:CreateTab
+      Tab:CollapsingHeader
+      Header:Checkbox / Button / Label
+
+    Dynamic Island is a small ScreenGui launcher only; the main menu is ImGui.
+    Coin collection remains subject to the game's normal server-side touch
+    and reward validation. This script does not fire remotes or spoof rewards.
+
+    Intended for your own Roblox experience or authorized testing.
+]]
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- The source script's coin farm was scoped to this place.
+local TARGET_PLACE_ID = 108903312165288
+if game.PlaceId ~= TARGET_PLACE_ID then
+    warn("[VIP DELS HUB] Coin Farm is intended for PlaceId " .. TARGET_PLACE_ID)
+end
+
+-- Stop previous copy cleanly.
+local env = (type(getgenv) == "function" and getgenv()) or _G
+env.VIP_DELS_COIN_FARM_RUN = (tonumber(env.VIP_DELS_COIN_FARM_RUN) or 0) + 1
+local runId = env.VIP_DELS_COIN_FARM_RUN
+local function isCurrent()
+    return env.VIP_DELS_COIN_FARM_RUN == runId
+end
+
+local oldIsland = PlayerGui:FindFirstChild("VIPDelsDynamicIsland")
+if oldIsland then oldIsland:Destroy() end
+
+-- Load ImGui library (same library family as the user's supplied example).
+local ImGui
+do
+    local url = "https://raw.githubusercontent.com/projctstealegg-commits/Roblox-ImGUI/refs/heads/main/ImGui.lua"
+    local ok, source = pcall(function()
+        return game:HttpGet(url)
+    end)
+    assert(ok and type(source) == "string" and #source > 1000,
+        "VIP DELS HUB: Could not load ImGui library: " .. tostring(source))
+    assert(type(loadstring) == "function", "VIP DELS HUB: loadstring is unavailable.")
+    local chunk = assert(loadstring(source))
+    local result = chunk()
+    ImGui = result
+    if type(ImGui) ~= "table" then
+        ImGui = env.ImGui or env.RobloxImGui
+    end
+    assert(type(ImGui) == "table" and type(ImGui.CreateWindow) == "function",
+        "VIP DELS HUB: ImGui.CreateWindow API is missing.")
+end
+
+local autoFarm = false
+local busy = false
+local statusText = "Idle"
+local foundCount = 0
+local lastCoinName = "None"
+local lastCoinDistance = 0
+local scanInterval = 0.35
+local teleportOffset = Vector3.new(0, 2.5, 0)
+local farmThread = 0
+local visited = {}
+
+local function getRoot()
+    local character = LocalPlayer.Character
+    return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+local function getCoinPart(model)
+    if model:IsA("BasePart") then
+        return model
+    end
+    return model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function isCoinModel(instance)
+    return instance:IsA("Model")
+        and string.find(string.lower(instance.Name), "coin", 1, true) ~= nil
+end
+
+local function findCoins()
+    local root = getRoot()
+    local candidates = {}
+    local nearestDistance = math.huge
+    local nearestName = "None"
+
+    for _, item in ipairs(workspace:GetDescendants()) do
+        if isCoinModel(item) then
+            local part = getCoinPart(item)
+            if part and part:IsDescendantOf(workspace) then
+                local distance = root and (root.Position - part.Position).Magnitude or math.huge
+                table.insert(candidates, {
+                    model = item,
+                    part = part,
+                    distance = distance,
+                })
+                if distance < nearestDistance then
+                    nearestDistance = distance
+                    nearestName = item.Name
+                end
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        return a.distance < b.distance
+    end)
+
+    foundCount = #candidates
+    lastCoinName = nearestName
+    lastCoinDistance = nearestDistance == math.huge and 0 or nearestDistance
+    return candidates
+end
+
+local function teleportToCoin(entry)
+    local character = LocalPlayer.Character
+    local root = getRoot()
+    if not character or not root then
+        return false, "Character not ready"
+    end
+    if not entry or not entry.model or not entry.model:IsDescendantOf(workspace) then
+        return false, "Coin disappeared"
+    end
+
+    local part = entry.part
+    if not part or not part:IsDescendantOf(workspace) then
+        return false, "Coin part unavailable"
+    end
+
+    -- Local character movement only. The game decides whether the normal
+    -- collection touch/reward is accepted by its server.
+    local destination = CFrame.new(part.Position + teleportOffset)
+    local ok, err = pcall(function()
+        character:PivotTo(destination)
+    end)
+    if not ok then
+        return false, tostring(err)
+    end
+    return true
+end
+
+local function runFarm(myThread)
+    while isCurrent() and autoFarm and farmThread == myThread do
+        local root = getRoot()
+        if not root then
+            statusText = "Waiting for character..."
+            task.wait(0.5)
+            continue
+        end
+
+        local coins = findCoins()
+        local target
+        for _, entry in ipairs(coins) do
+            if not visited[entry.model] then
+                target = entry
+                break
+            end
+        end
+
+        if not target then
+            -- Reset stale entries that have disappeared; if all visible
+            -- coins are still present, wait briefly for the map to respawn.
+            for model in pairs(visited) do
+                if not model or not model:IsDescendantOf(workspace) then
+                    visited[model] = nil
+                end
+            end
+            statusText = (#coins == 0) and "No coin models detected" or "Waiting for coin respawn"
+            task.wait(0.5)
+        else
+            busy = true
+            statusText = "Teleporting to " .. target.model.Name
+            local ok, reason = teleportToCoin(target)
+            if ok then
+                visited[target.model] = true
+                statusText = "Moved to " .. target.model.Name .. " • waiting for normal pickup"
+            else
+                statusText = "Teleport failed: " .. tostring(reason)
+            end
+            busy = false
+            task.wait(scanInterval)
+        end
+    end
+    busy = false
+end
+
+local Window = ImGui:CreateWindow({
+    Title = "VIP DELS HUB  •  COIN FARM",
+    Size = UDim2.fromOffset(590, 420),
+    Position = UDim2.new(0.5, 0, 0.5, 0),
+    Border = true,
+    BorderThickness = 2,
+    BackgroundTransparency = 0.14,
+    CornerRadius = UDim.new(0, 8),
+    NoCollapse = false,
+    NoResize = false,
+    NoDrag = false,
+})
+pcall(function() Window:Center() end)
+
+local FarmTab = Window:CreateTab({Name = "Coin Farm"})
+local FarmHeader = FarmTab:CollapsingHeader({
+    Title = "INSTANT COIN TELEPORT",
+    Open = true,
+})
+
+FarmHeader:Label({
+    Text = "PlaceId: " .. tostring(TARGET_PLACE_ID) .. " • Detects workspace Models with 'coin' in the name.",
+})
+FarmHeader:Label({
+    Text = "Fast local teleport to the nearest unvisited coin. Collection/reward is controlled by the game server.",
+})
+
+local statusTable = FarmHeader:Table({
+    RowBackground = true,
+    Border = true,
+    RowsFill = false,
+    Size = UDim2.new(1, 0, 0, 120),
+})
+
+local function refreshStatus()
+    statusTable:ClearRows()
+    local rows = {
+        "AUTO FARM: " .. (autoFarm and "ON" or "OFF"),
+        "STATUS: " .. statusText,
+        "COINS DETECTED: " .. tostring(foundCount),
+        "NEAREST COIN: " .. tostring(lastCoinName),
+        "DISTANCE: " .. string.format("%.1f studs", lastCoinDistance),
+    }
+    for _, line in ipairs(rows) do
+        local row = statusTable:CreateRow()
+        row:CreateColumn():Label({Text = line})
+    end
+end
+
+FarmHeader:Button({
+    Text = "SCAN COINS",
+    Callback = function()
+        findCoins()
+        statusText = "Scan complete"
+        refreshStatus()
+    end,
+})
+
+FarmHeader:Checkbox({
+    Label = "AUTO FARM COINS (FAST TELEPORT)",
+    Value = false,
+    Callback = function(_, value)
+        autoFarm = value == true
+        farmThread += 1
+        local thisThread = farmThread
+        if autoFarm then
+            visited = {}
+            statusText = "Starting..."
+            task.spawn(function()
+                runFarm(thisThread)
+            end)
+        else
+            busy = false
+            statusText = "Stopped"
+        end
+        refreshStatus()
+    end,
+})
+
+FarmHeader:Button({
+    Text = "RESET VISITED COINS",
+    Callback = function()
+        visited = {}
+        statusText = "Visited list reset"
+        refreshStatus()
+    end,
+})
+
+FarmHeader:Button({
+    Text = "STOP AUTO FARM",
+    Callback = function()
+        autoFarm = false
+        farmThread += 1
+        busy = false
+        statusText = "Stopped"
+        refreshStatus()
+    end,
+})
+
+-- Dynamic Island launcher. Main menu above remains actual ImGui.
+local islandGui = Instance.new("ScreenGui")
+islandGui.Name = "VIPDelsDynamicIsland"
+islandGui.ResetOnSpawn = false
+islandGui.IgnoreGuiInset = true
+islandGui.DisplayOrder = 100000
+islandGui.Parent = PlayerGui
+
+local island = Instance.new("TextButton")
+island.Name = "IslandButton"
+island.Size = UDim2.fromOffset(142, 44)
+island.Position = UDim2.fromOffset(14, 260)
+island.BackgroundColor3 = Color3.fromRGB(9, 10, 15)
+island.BorderSizePixel = 0
+island.AutoButtonColor = false
+island.Text = "♛  VIP DELS HUB"
+island.TextColor3 = Color3.fromRGB(241, 197, 103)
+island.Font = Enum.Font.GothamBold
+island.TextSize = 12
+island.Parent = islandGui
+local islandCorner = Instance.new("UICorner")
+islandCorner.CornerRadius = UDim.new(0, 10)
+islandCorner.Parent = island
+local islandStroke = Instance.new("UIStroke")
+islandStroke.Color = Color3.fromRGB(190, 145, 62)
+islandStroke.Thickness = 1.2
+islandStroke.Parent = island
+
+local visible = true
+local function setVisible(state)
+    visible = state
+    pcall(function()
+        if type(Window.SetVisible) == "function" then
+            Window:SetVisible(visible)
+        elseif Window._native and type(Window._native.SetVisible) == "function" then
+            Window._native:SetVisible(visible)
+        end
+    end)
+    island.Text = visible and "♛  VIP DELS HUB  •  OPEN" or "♛  VIP DELS HUB  •  SHOW"
+end
+
+island.Activated:Connect(function()
+    setVisible(not visible)
+end)
+
+local dragging = false
+local dragStart
+local startPos
+island.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = island.Position
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        island.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+UserInputService.InputBegan:Connect(function(input, processed)
+    if not processed and input.KeyCode == Enum.KeyCode.RightShift then
+        setVisible(not visible)
+    end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function()
+    if autoFarm then
+        task.wait(0.4)
+        farmThread += 1
+        local thisThread = farmThread
+        task.spawn(function()
+            runFarm(thisThread)
+        end)
+    end
+end)
+
+refreshStatus()
+
+env.VIP_DELS_COIN_FARM_CLEANUP = function()
+    env.VIP_DELS_COIN_FARM_RUN = runId + 1
+    autoFarm = false
+    farmThread += 1
+    if islandGui then islandGui:Destroy() end
+    pcall(function()
+        if type(Window.SetVisible) == "function" then Window:SetVisible(false) end
+    end)
+end
+
+print("[VIP DELS HUB] ImGui Coin Farm + Dynamic Island loaded.")
